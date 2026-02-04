@@ -1,0 +1,325 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Offline Launcher (file picker + IndexedDB)</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    body { font-family: system-ui, Arial; margin:0; display:flex; height:100vh; }
+    #sidebar { width:340px; border-right:1px solid #ddd; padding:12px; box-sizing:border-box; overflow:auto; }
+    #main { flex:1; display:flex; flex-direction:column; }
+    header { padding:12px; border-bottom:1px solid #eee; display:flex; align-items:center; gap:8px; }
+    #gameFrame { flex:1; border:0; width:100%; background:#000; }
+    .game-item { padding:8px; border:1px solid #eee; margin-bottom:8px; border-radius:6px; display:flex; justify-content:space-between; align-items:center; gap:8px; }
+    button { padding:6px 10px; }
+    input[type=text] { width:100%; padding:6px; box-sizing:border-box; }
+    small { color:#666; }
+  </style>
+</head>
+<body>
+  <div id="sidebar">
+    <h2>Games (stored locally)</h2>
+    <div id="gamesList"></div>
+
+    <h3>Add game</h3>
+    <div>
+      <input id="newName" placeholder="Optional display name" />
+      <div style="margin-top:6px">
+        <button id="addViaFileBtn">Add via file picker</button>
+        <button id="clearAllBtn" style="float:right">Clear all</button>
+      </div>
+      <input id="fileInput" type="file" accept="text/html" style="display:none" />
+    </div>
+
+    <h3>Saves</h3>
+    <div>
+      <button id="exportSaves">Export saves (JSON)</button>
+      <button id="importSaves">Import saves (JSON)</button>
+      <input id="importFile" type="file" accept=".json" style="display:none" />
+    </div>
+
+    <hr/>
+    <small>Tip: Use "Add via file picker" to import HTML game files. They are saved in your browser (IndexedDB) so they persist. The launcher uses postMessage for saving/loading; games that want persistence should use the API shown in the example game from previous instructions.</small>
+  </div>
+
+  <div id="main">
+    <header>
+      <strong id="currentTitle">No game loaded</strong>
+      <div style="flex:1"></div>
+      <div>
+        <button id="closeGame">Close</button>
+      </div>
+    </header>
+
+    <iframe id="gameFrame" sandbox="allow-scripts allow-same-origin"></iframe>
+
+    <footer style="padding:8px; border-top:1px solid #eee;">
+      <small>Launcher saves stored in localStorage under 'launcher_saves'. Games stored in IndexedDB 'launcher-games'.</small>
+    </footer>
+  </div>
+
+  <script>
+    // Keys
+    const STORAGE_SAVES = 'launcher_saves';
+    const IDB_DB = 'launcher-games-db';
+    const IDB_STORE = 'games';
+
+    // UI
+    const gamesListEl = document.getElementById('gamesList');
+    const fileInput = document.getElementById('fileInput');
+    const addViaFileBtn = document.getElementById('addViaFileBtn');
+    const importFile = document.getElementById('importFile');
+    const currentTitle = document.getElementById('currentTitle');
+    const closeGameBtn = document.getElementById('closeGame');
+    const gameFrame = document.getElementById('gameFrame');
+    const newNameInput = document.getElementById('newName');
+    const clearAllBtn = document.getElementById('clearAllBtn');
+
+    // Runtime state
+    let db = null;
+    let games = []; // metadata: { id, name, filename }
+    let currentGameId = null;
+    let activeBlobUrl = null;
+
+    // --- IndexedDB helpers ---
+    function openDb() {
+      return new Promise((resolve, reject) => {
+        const req = indexedDB.open(IDB_DB, 1);
+        req.onupgradeneeded = e => {
+          const d = e.target.result;
+          if (!d.objectStoreNames.contains(IDB_STORE)) {
+            d.createObjectStore(IDB_STORE, { keyPath: 'id', autoIncrement: true });
+          }
+        };
+        req.onsuccess = e => { db = e.target.result; resolve(db); };
+        req.onerror = e => reject(e.target.error);
+      });
+    }
+
+    function idbGetAll() {
+      return new Promise((resolve, reject) => {
+        const tx = db.transaction(IDB_STORE, 'readonly');
+        const store = tx.objectStore(IDB_STORE);
+        const req = store.getAll();
+        req.onsuccess = e => resolve(e.target.result);
+        req.onerror = e => reject(e.target.error);
+      });
+    }
+
+    function idbAdd(record) {
+      return new Promise((resolve, reject) => {
+        const tx = db.transaction(IDB_STORE, 'readwrite');
+        const store = tx.objectStore(IDB_STORE);
+        const req = store.add(record);
+        req.onsuccess = e => resolve(e.target.result); // id
+        req.onerror = e => reject(e.target.error);
+      });
+    }
+
+    function idbGet(id) {
+      return new Promise((resolve, reject) => {
+        const tx = db.transaction(IDB_STORE, 'readonly');
+        const store = tx.objectStore(IDB_STORE);
+        const req = store.get(id);
+        req.onsuccess = e => resolve(e.target.result);
+        req.onerror = e => reject(e.target.error);
+      });
+    }
+
+    function idbDelete(id) {
+      return new Promise((resolve, reject) => {
+        const tx = db.transaction(IDB_STORE, 'readwrite');
+        const store = tx.objectStore(IDB_STORE);
+        const req = store.delete(id);
+        req.onsuccess = () => resolve();
+        req.onerror = e => reject(e.target.error);
+      });
+    }
+
+    function idbClear() {
+      return new Promise((resolve, reject) => {
+        const tx = db.transaction(IDB_STORE, 'readwrite');
+        const store = tx.objectStore(IDB_STORE);
+        const req = store.clear();
+        req.onsuccess = () => resolve();
+        req.onerror = e => reject(e.target.error);
+      });
+    }
+
+    // --- localStorage saves helpers ---
+    function loadSaves() { try { return JSON.parse(localStorage.getItem(STORAGE_SAVES)) || {}; } catch(e){ return {}; } }
+    function saveSaves(obj) { localStorage.setItem(STORAGE_SAVES, JSON.stringify(obj)); }
+
+    // --- UI actions ---
+    addViaFileBtn.addEventListener('click', ()=> fileInput.click());
+    fileInput.addEventListener('change', async (e) => {
+      const f = e.target.files[0];
+      if (!f) return;
+      const displayName = newNameInput.value.trim() || f.name;
+      // Read file as blob (we already have File)
+      const record = { name: displayName, filename: f.name, blob: f };
+      try {
+        const id = await idbAdd(record);
+        await refreshGames();
+        newNameInput.value = '';
+        fileInput.value = '';
+      } catch (err) {
+        alert('Failed to store file: ' + err);
+      }
+    });
+
+    clearAllBtn.addEventListener('click', async ()=>{
+      if (!confirm('Delete all stored games and their data?')) return;
+      await idbClear();
+      // also clear saves
+      localStorage.removeItem(STORAGE_SAVES');
+      await refreshGames();
+      closeGame();
+    });
+
+    document.getElementById('exportSaves').addEventListener('click', ()=>{
+      const saves = loadSaves();
+      const data = JSON.stringify(saves, null, 2);
+      const blob = new Blob([data], {type:'application/json'});
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'launcher-saves.json';
+      a.click();
+      URL.revokeObjectURL(url);
+    });
+
+    document.getElementById('importSaves').addEventListener('click', ()=> importFile.click());
+    importFile.addEventListener('change', (e)=>{
+      const f = e.target.files[0];
+      if (!f) return;
+      const r = new FileReader();
+      r.onload = ()=>{
+        try {
+          const obj = JSON.parse(r.result);
+          saveSaves(obj);
+          alert('Saves imported');
+        } catch(e){ alert('Invalid JSON'); }
+      };
+      r.readAsText(f);
+    });
+
+    // Play / close
+    closeGameBtn.addEventListener('click', closeGame);
+    function closeGame(){
+      if (activeBlobUrl) { URL.revokeObjectURL(activeBlobUrl); activeBlobUrl = null; }
+      gameFrame.src = 'about:blank';
+      currentGameId = null;
+      currentTitle.textContent = 'No game loaded';
+    }
+
+    // Launch a stored game (create a blob URL from the stored blob)
+    async function launchGame(id) {
+      const rec = await idbGet(id);
+      if (!rec) { alert('Game not found'); return; }
+      // revoke previous blob url
+      if (activeBlobUrl) { URL.revokeObjectURL(activeBlobUrl); activeBlobUrl = null; }
+      const blob = rec.blob;
+      const blobUrl = URL.createObjectURL(blob);
+      activeBlobUrl = blobUrl;
+      currentGameId = id;
+      currentTitle.textContent = rec.name || rec.filename || ('Game #' + id);
+      gameFrame.src = blobUrl;
+    }
+
+    // Remove game
+    async function removeGame(id) {
+      if (!confirm('Remove stored game?')) return;
+      await idbDelete(id);
+      // optionally remove related saves (key by id or filename). We will key saves by stored-game-id to avoid collisions.
+      const saves = loadSaves();
+      delete saves['id:' + id];
+      saveSaves(saves);
+      await refreshGames();
+      if (currentGameId === id) closeGame();
+    }
+
+    // Render stored games
+    async function refreshGames() {
+      games = await idbGetAll();
+      gamesListEl.innerHTML = '';
+      if (!games || games.length === 0) {
+        gamesListEl.innerHTML = '<div style="color:#666">No games. Use "Add via file picker" to import a game HTML file.</div>';
+        return;
+      }
+      games.forEach(g => {
+        const div = document.createElement('div');
+        div.className = 'game-item';
+        div.innerHTML = `<div>
+            <strong>${escapeHtml(g.name)}</strong><br/><small>${escapeHtml(g.filename)}</small>
+          </div>`;
+        const btns = document.createElement('div');
+        const playBtn = document.createElement('button'); playBtn.textContent = 'Play'; playBtn.onclick = ()=> launchGame(g.id);
+        const removeBtn = document.createElement('button'); removeBtn.textContent = 'Remove'; removeBtn.onclick = ()=> removeGame(g.id);
+        btns.appendChild(playBtn); btns.appendChild(removeBtn);
+        div.appendChild(btns);
+        gamesListEl.appendChild(div);
+      });
+    }
+
+    function escapeHtml(s){ return String(s || '').replace(/[&<>"']/g, c=>({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' })[c]); }
+
+    // --- Messaging: same API as earlier launcher ---
+    // when iframe loads, send init with saved slots for this game (keyed by id)
+    gameFrame.addEventListener('load', async ()=>{
+      if (currentGameId === null) return;
+      const saves = loadSaves();
+      const key = 'id:' + currentGameId;
+      const gameSaves = saves[key] || {};
+      postToFrame({ type: 'launcher.init', saves: gameSaves, gameId: currentGameId });
+    });
+
+    window.addEventListener('message', async (ev)=>{
+      const msg = ev.data || {};
+      if (!msg || typeof msg !== 'object') return;
+
+      if (msg.type === 'launcher.save') {
+        // slot + data + optional gameId
+        const gid = (msg.gameId !== undefined) ? msg.gameId : currentGameId;
+        if (gid === null) return;
+        const saves = loadSaves();
+        const key = 'id:' + gid;
+        saves[key] = saves[key] || {};
+        const slot = msg.slot || 'default';
+        saves[key][slot] = msg.data;
+        saveSaves(saves);
+        postToFrame({ type: 'launcher.save.ack', slot, gameId: gid });
+      } else if (msg.type === 'launcher.load') {
+        const gid = (msg.gameId !== undefined) ? msg.gameId : currentGameId;
+        if (gid === null) return;
+        const saves = loadSaves();
+        const key = 'id:' + gid;
+        const val = (saves[key] && saves[key][msg.slot || 'default']) || null;
+        postToFrame({ type: 'launcher.load.response', slot: msg.slot || 'default', data: val, requestId: msg.requestId || null, gameId: gid });
+      } else if (msg.type === 'launcher.listSaves') {
+        const gid = (msg.gameId !== undefined) ? msg.gameId : currentGameId;
+        if (gid === null) return;
+        const saves = loadSaves();
+        const key = 'id:' + gid;
+        const list = Object.keys((saves[key]||{}));
+        postToFrame({ type: 'launcher.listSaves.response', list, gameId: gid, requestId: msg.requestId||null });
+      }
+    });
+
+    function postToFrame(message) {
+      try { gameFrame.contentWindow.postMessage(message, '*'); } catch(e) { /* ignore */ }
+    }
+
+    // --- startup ---
+    (async function init(){
+      try {
+        await openDb();
+        await refreshGames();
+      } catch (err) {
+        console.error('IDB init failed', err);
+        gamesListEl.innerHTML = '<div style="color:red">IndexedDB not available. Launcher needs IndexedDB to store game files locally.</div>';
+      }
+    })();
+  </script>
+</body>
+</html>
