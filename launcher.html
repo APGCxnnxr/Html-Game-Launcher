@@ -91,6 +91,24 @@
       font-size: 0.8rem;
       text-align: center;
       padding: 10px;
+      background-size: cover;
+      background-position: center;
+      background-repeat: no-repeat;
+      position: relative;
+    }
+    
+    .thumb-text {
+        z-index: 1;
+        text-shadow: 0 2px 4px rgba(0,0,0,0.8);
+    }
+    
+    /* Overlay to make text readable if image is present */
+    .thumb.has-img::after {
+        content: '';
+        position: absolute;
+        inset: 0;
+        background: rgba(0,0,0,0.3);
+        border-radius: 8px;
     }
 
     button { 
@@ -137,7 +155,7 @@
     <main>
       <section id="home">
         <h2 style="margin-top:0">Your Library</h2>
-        <p style="color: var(--muted)">Add a folder (Chrome/Edge) or import HTML files to begin.</p>
+        <p style="color: var(--muted)">Add a folder (Chrome/Edge) or import HTML files to begin. <br> <small>Tip: Name an image matching your game (e.g., game.html + game.png) for auto-icons!</small></p>
         <div class="grid" id="gamesGrid"></div>
       </section>
 
@@ -215,6 +233,19 @@
       });
     }
 
+    // --- Icon Extraction Helper ---
+    function findIconInHTML(html) {
+        // Looks for <link rel="icon" href="...">
+        // Only returns if it is a data URI or http link to prevent broken local links
+        const match = html.match(/<link[^>]+rel=["'](?:shortcut )?icon["'][^>]+href=["'](.*?)["']/i);
+        if (match && match[1]) {
+            if (match[1].startsWith('data:') || match[1].startsWith('http')) {
+                return match[1];
+            }
+        }
+        return null;
+    }
+
     function renderTiles() {
       gamesGrid.innerHTML = '';
       const all = [...BUILT_IN_GAMES.map(g => ({...g, source:'builtin'})), ...games];
@@ -234,8 +265,18 @@
             `;
         }
 
+        // Icon Logic
+        let thumbStyle = '';
+        let thumbClass = 'thumb';
+        if (g.icon) {
+            thumbStyle = `background-image: url('${g.icon}')`;
+            thumbClass += ' has-img';
+        }
+
         tile.innerHTML = `
-          <div class="thumb">${g.name.substring(0, 15)}</div>
+          <div class="${thumbClass}" style="${thumbStyle}">
+            <span class="thumb-text">${g.name.substring(0, 15)}</span>
+          </div>
           <div style="flex:1">
             <h3 style="margin:5px 0">${g.name}</h3>
             <p style="font-size:0.85rem; color:var(--muted)">${g.desc || 'Local Game'}</p>
@@ -310,14 +351,11 @@
         const newName = prompt("Enter new name for this game:", g.name);
         if (!newName || newName.trim() === "") return;
         
-        // Update in memory
         g.name = newName.trim();
         
-        // Update in IDB
         const record = await idbAction('readonly', s => s.get(id));
         let newRecord;
         if (typeof record === 'string') {
-            // Upgrade legacy string to object
             newRecord = { name: g.name, content: record };
         } else {
             newRecord = { ...record, name: g.name };
@@ -336,11 +374,18 @@
       const text = await file.text();
       const id = 'import-' + Date.now();
       
-      // Store object with metadata instead of just string
-      const record = { name: file.name, content: text, created: Date.now() };
+      // Try to find icon in HTML
+      const embeddedIcon = findIconInHTML(text);
+
+      const record = { 
+          name: file.name, 
+          content: text, 
+          created: Date.now(),
+          icon: embeddedIcon // Save detected icon
+      };
       
       await idbAction('readwrite', s => s.put(record, id));
-      games.push({ id, name: file.name, source: 'file' });
+      games.push({ id, name: file.name, source: 'file', icon: embeddedIcon });
       renderTiles();
       e.target.value = ''; 
     };
@@ -356,11 +401,41 @@
     async function scanFolder() {
       if (!folderHandle) return;
       const folderGames = [];
+      
+      // First pass: collect all files to map
+      const fileMap = new Map();
       for await (const [name, handle] of folderHandle.entries()) {
+          fileMap.set(name, handle);
+      }
+
+      // Second pass: Identify HTML games and look for matching images
+      for (const [name, handle] of fileMap) {
         if (name.endsWith('.html')) {
-          folderGames.push({ id: 'folder-'+name, name, handle, source: 'folder' });
+            const baseName = name.substring(0, name.lastIndexOf('.'));
+            let iconUrl = null;
+
+            // Check for matching image files (e.g. game.html -> game.png)
+            const extensions = ['.png', '.jpg', '.jpeg', '.gif', '.webp'];
+            for (const ext of extensions) {
+                const imgName = baseName + ext;
+                if (fileMap.has(imgName)) {
+                    const imgHandle = fileMap.get(imgName);
+                    const file = await imgHandle.getFile();
+                    iconUrl = URL.createObjectURL(file);
+                    break; 
+                }
+            }
+
+            folderGames.push({ 
+                id: 'folder-'+name, 
+                name, 
+                handle, 
+                source: 'folder',
+                icon: iconUrl
+            });
         }
       }
+      
       games = [...games.filter(g => g.source !== 'folder'), ...folderGames];
       renderTiles();
     }
@@ -393,7 +468,6 @@
 
     // --- Init ---
     (async () => {
-      // Get all values (records) to retrieve names
       const records = await idbAction('readonly', s => s.getAll());
       const keys = await idbAction('readonly', s => s.getAllKeys());
       
@@ -401,9 +475,9 @@
         records.forEach((rec, i) => {
           const k = keys[i];
           if (k.startsWith('import-')) {
-            // Handle both legacy (string) and new (object) formats
             const name = (typeof rec === 'object' && rec.name) ? rec.name : 'Imported Game';
-            games.push({ id: k, name: name, source: 'file' });
+            const icon = (typeof rec === 'object' && rec.icon) ? rec.icon : null;
+            games.push({ id: k, name: name, source: 'file', icon: icon });
           }
         });
         renderTiles();
