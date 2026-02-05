@@ -49,7 +49,7 @@
     }
 
     .brand { font-weight: 700; letter-spacing: -0.5px; font-size: 1.2rem; }
-    
+     
     .controls { display: flex; gap: 10px; }
 
     main { padding: 24px; flex: 1; }
@@ -118,7 +118,7 @@
       margin-bottom: 15px;
     }
     #gameFrame { width: 100%; flex: 1; border: 0; border-radius: 12px; background: #000; }
-    
+     
     footer { margin-top: 10px; color: var(--muted); font-size: 0.8rem; }
   </style>
 </head>
@@ -202,8 +202,18 @@
         req.onerror = () => rej(req.error);
       });
       const tx = db.transaction('meta', mode);
-      const val = await callback(tx.objectStore('meta'));
-      return new Promise((res) => { tx.oncomplete = () => res(val); });
+      const req = callback(tx.objectStore('meta'));
+      
+      return new Promise((resolve, reject) => {
+        tx.oncomplete = () => {
+          // If the callback returned an IDBRequest, return its result (the actual data)
+          // otherwise return the value directly
+          if (req instanceof IDBRequest) resolve(req.result);
+          else resolve(req);
+        };
+        tx.onerror = () => reject(tx.error);
+        tx.onabort = () => reject(tx.error);
+      });
     }
 
     function renderTiles() {
@@ -233,6 +243,12 @@
 
     async function openGame(id, source) {
       let content;
+      
+      // CRITICAL FIX: Reset both attributes to prevent conflicts
+      // If srcdoc exists (even if empty), browsers ignore src.
+      gameFrame.removeAttribute('srcdoc');
+      gameFrame.removeAttribute('src');
+
       if (source === 'builtin') {
         const g = BUILT_IN_GAMES.find(x => x.id === id);
         currentGame = g;
@@ -256,12 +272,20 @@
     }
 
     function closeGame() {
-      if (gameFrame.src.startsWith('blob:')) URL.revokeObjectURL(gameFrame.src);
-      gameFrame.src = 'about:blank';
-      gameFrame.srcdoc = '';
+      // Cleanup Blob URL to avoid memory leaks
+      if (gameFrame.src && gameFrame.src.startsWith('blob:')) {
+        URL.revokeObjectURL(gameFrame.src);
+      }
+      
+      // Clean frame state
+      gameFrame.removeAttribute('src');
+      gameFrame.removeAttribute('srcdoc');
+      gameFrame.src = 'about:blank'; // Visual reset
+      
       playerSection.style.display = 'none';
       homeSection.style.display = 'block';
       document.getElementById('saveStatus').textContent = '';
+      currentGame = null;
     }
 
     async function removeGame(id) {
@@ -282,6 +306,8 @@
       await idbAction('readwrite', s => s.put(text, id));
       games.push({ id, name: file.name, source: 'file' });
       renderTiles();
+      // Reset input so same file can be selected again if needed
+      e.target.value = ''; 
     };
 
     document.getElementById('pickFolderBtn').onclick = async () => {
@@ -306,7 +332,7 @@
 
     // --- Communications ---
     window.onmessage = (e) => {
-      if (e.data.type === 'launcher.save') {
+      if (e.data.type === 'launcher.save' && currentGame) {
         const saves = JSON.parse(localStorage.getItem('launcher_saves') || '{}');
         saves[currentGame.id] = { default: e.data.data };
         localStorage.setItem('launcher_saves', JSON.stringify(saves));
@@ -333,10 +359,12 @@
     // --- Init ---
     (async () => {
       const keys = await idbAction('readonly', s => s.getAllKeys());
-      keys.forEach(k => {
-        if (k.startsWith('import-')) games.push({ id: k, name: 'Imported Game', source: 'file' });
-      });
-      renderTiles();
+      if (keys && Array.isArray(keys)) {
+        keys.forEach(k => {
+          if (k.startsWith('import-')) games.push({ id: k, name: 'Imported Game', source: 'file' });
+        });
+        renderTiles();
+      }
     })();
   </script>
 </body>
