@@ -1,6 +1,7 @@
 # Offline Game Launcher
 
 # Known Bugs - Will fix in next release - 
+- Games do not load
 - Buttons in fullscreen are not in the right spot
 - Eaglercraft ( one of the main things i wanted to work ) Does not load
 - Ui Sometimes is unresponsive
